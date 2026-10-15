@@ -7,7 +7,6 @@ const modalClose = document.getElementById('modalClose');
 const modalSubject = document.getElementById('modalSubject');
 const modalDate = document.getElementById('modalDate');
 const modalFrom = document.getElementById('modalFrom');
-const modalTo = document.getElementById('modalTo');
 const modalSubjectLine = document.getElementById('modalSubjectLine');
 const modalBody = document.getElementById('modalBody');
 
@@ -15,18 +14,31 @@ let users = [];
 let currentUser = null;
 let currentEmails = [];
 
+
 async function loadUsers() {
   try {
     const res = await fetch('/api/users');
+
+    if (!res.ok) {
+      throw new Error('Failed to load users');
+    }
+
     users = await res.json();
 
-    userSelect.innerHTML = '<option value="" disabled selected>Select account</option>';
+    // Populate the dropdown with fetched users
+    userSelect.innerHTML = '';
 
     if (users.length === 0) {
-      userSelect.innerHTML = '<option value="" disabled>No accounts found</option>';
+      userSelect.innerHTML = '<option value="">No accounts found</option>';
+      emailTableBody.innerHTML = `
+        <tr>
+          <td colspan="3" class="empty-row">No accounts available</td>
+        </tr>
+      `;
       return;
     }
 
+    // Add all users to the dropdown
     users.forEach((u) => {
       const option = document.createElement('option');
       option.value = u.id;
@@ -34,6 +46,7 @@ async function loadUsers() {
       userSelect.appendChild(option);
     });
 
+    // Handle dropdown selection changes
     userSelect.onchange = () => {
       const selectedId = userSelect.value;
       const user = users.find((u) => String(u.id) === String(selectedId));
@@ -41,10 +54,19 @@ async function loadUsers() {
         selectUser(user);
       }
     };
+
+    // Automatically select the active user in dropdown and fetch their emails
+    await selectUser(users[0]);
   } catch (err) {
     console.error('Failed to load users:', err);
+    emailTableBody.innerHTML = `
+      <tr>
+        <td colspan="3" class="empty-row">Failed to load accounts: ${escapeHtml(err.message)}</td>
+      </tr>
+    `;
   }
 }
+
 
 async function selectUser(user) {
   currentUser = user;
@@ -52,15 +74,19 @@ async function selectUser(user) {
   await fetchEmails();
 }
 
-async function fetchEmails() {
+async function fetchEmails(forceRefresh = false, isSilent = false) {
   if (!currentUser) {
     return;
   }
 
-  emailTableBody.innerHTML = '<tr><td colspan="3" class="empty-row">Loading...</td></tr>';
+  // Only show "Loading..." if the table is completely empty (initial load)
+  if (!isSilent && currentEmails.length === 0) {
+    emailTableBody.innerHTML = '<tr><td colspan="3" class="empty-row">Loading...</td></tr>';
+  }
 
   try {
-    const res = await fetch(`/api/emails/${currentUser.id}`);
+    const url = `/api/emails/${currentUser.id}${forceRefresh ? '?refresh=1' : ''}`;
+    const res = await fetch(url);
     const data = await res.json();
 
     if (data.error) {
@@ -70,7 +96,9 @@ async function fetchEmails() {
     currentEmails = data.emails;
     renderTable();
   } catch (err) {
-    emailTableBody.innerHTML = `<tr><td colspan="3" class="empty-row">Error: ${escapeHtml(err.message)}</td></tr>`;
+    if (!isSilent) {
+      emailTableBody.innerHTML = `<tr><td colspan="3" class="empty-row">Error: ${escapeHtml(err.message)}</td></tr>`;
+    }
     console.error(err);
   }
 }
@@ -104,7 +132,6 @@ async function openModal(idx) {
   modalSubject.textContent = email.subject;
   modalDate.textContent = formatFullDate(email.date);
   modalFrom.textContent = email.from;
-  modalTo.textContent = email.to;
   modalSubjectLine.textContent = email.subject;
   modalBody.innerHTML = '<div style="padding:20px;color:#8e8e93;">Loading...</div>';
 
@@ -188,7 +215,7 @@ refreshBtn.onclick = async () => {
   refreshBtn.classList.add('spinning');
 
   try {
-    await fetchEmails();
+    await fetchEmails(true);
   } finally {
     setTimeout(() => {
       refreshBtn.classList.remove('spinning');
@@ -211,3 +238,10 @@ document.addEventListener('keydown', (e) => {
 });
 
 loadUsers();
+
+// Auto-sync every 15 seconds without reloading the page or flickering the screen
+setInterval(() => {
+  if (currentUser && modalOverlay.classList.contains('hidden')) {
+    fetchEmails(true, true);
+  }
+}, 15000);

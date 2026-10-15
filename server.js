@@ -45,12 +45,14 @@ function createConnection(user) {
 
     imap.once('ready', () => resolve(imap));
 
-    imap.once('error', (err) => {
+    imap.on('error', (err) => {
+      console.error(`IMAP error for ${user.email}:`, err.message);
       pool.delete(user.id);
       reject(err);
     });
 
-    imap.once('end', () => {
+    imap.on('end', () => {
+      console.log(`IMAP connection ended for ${user.email}`);
       pool.delete(user.id);
     });
 
@@ -85,15 +87,48 @@ function getConnection(user) {
   });
 }
 
-function ensureInboxOpen(user, imap) {
+function ensureInboxOpen(user, imap, forceReopen = false) {
   return new Promise((resolve, reject) => {
     const conn = pool.get(user.id);
 
-    if (conn && conn.box) return resolve(conn.box);
+    if (conn && conn.box && !forceReopen) {
+      imap.status('INBOX', (err, boxStatus) => {
+        if (!err && boxStatus) {
+          conn.box.messages.total = boxStatus.messages.total;
+          conn.box.messages.new = boxStatus.messages.new;
+        }
+        resolve(conn.box);
+      });
+      return;
+    }
 
     imap.openBox('INBOX', true, (err, box) => {
       if (err) return reject(err);
-      if (conn) conn.box = box;
+      if (conn) {
+        conn.box = box;
+
+        // Listen for new mail notifications pushed from Gmail in real-time
+        if (!conn.listening) {
+          conn.listening = true;
+          imap.on('mail', async () => {
+            console.log(`[${user.email}] Realtime mail event received! Syncing in background...`);
+            try {
+              const freshEmails = await fetchLastEmails(user, 10, true);
+              cache.set(user.id, {
+                payload: {
+                  user: { id: user.id, name: user.name, email: user.email },
+                  count: freshEmails.length,
+                  emails: freshEmails,
+                },
+                at: Date.now(),
+              });
+              console.log(`[${user.email}] Memory cache updated via background push.`);
+            } catch (syncErr) {
+              console.error(`[${user.email}] Background mail sync error:`, syncErr.message);
+            }
+          });
+        }
+      }
       resolve(box);
     });
   });
@@ -150,7 +185,7 @@ app.delete('/api/users/:id', (req, res) => {
   res.json({ success: true });
 });
 
-function fetchLastEmails(user, limit = 10) {
+function fetchLastEmails(user, limit = 10, forceRefresh = false) {
   return new Promise(async (resolve, reject) => {
     const t0 = Date.now();
     const mark = (label) => {
@@ -163,7 +198,7 @@ function fetchLastEmails(user, limit = 10) {
     try {
       imap = await getConnection(user);
       mark('connection acquired');
-      box = await ensureInboxOpen(user, imap);
+      box = await ensureInboxOpen(user, imap, forceRefresh);
       mark('openBox done');
     } catch (err) {
       return reject(err);
@@ -258,7 +293,10 @@ function fetchOneBody(user, seqno) {
       });
     });
 
-    fetch.once('error', reject);
+    fetch.once('error', (err) => {
+      pool.delete(user.id);
+      reject(err);
+    });
 
     fetch.once('end', async () => {
       mark(`body downloaded (${raw.length} bytes)`);
@@ -293,22 +331,39 @@ app.get('/api/emails/:userId', async (req, res) => {
   const forceRefresh = req.query.refresh === '1';
   const cached = cache.get(user.id);
 
-  if (cached && !forceRefresh && Date.now() - cached.at < CACHE_TTL_MS) {
-    console.log(`[${user.email}] cache hit (age ${Date.now() - cached.at}ms)`);
+  // If we have cached/in-memory data, return immediately (<10ms)
+  // And if forceRefresh is true, fetch fresh emails asynchronously in the background
+  if (cached) {
+    if (forceRefresh) {
+      // Trigger instant background sync without blocking client response
+      fetchLastEmails(user, 10, true)
+        .then((freshEmails) => {
+          cache.set(user.id, {
+            payload: {
+              user: { id: user.id, name: user.name, email: user.email },
+              count: freshEmails.length,
+              emails: freshEmails,
+            },
+            at: Date.now(),
+          });
+        })
+        .catch((e) => console.error(`Background refresh error for ${user.email}:`, e.message));
+    }
+    console.log(`[${user.email}] instant memory return (<10ms)`);
     return res.json({ ...cached.payload, cached: true });
   }
 
   const t0 = Date.now();
   try {
-    console.log(`Fetching emails for ${user.email}`);
-    const emails = await fetchLastEmails(user, 10);
+    console.log(`Fetching emails for ${user.email} (initial warm-up)`);
+    const emails = await fetchLastEmails(user, 10, false);
     const payload = {
       user: { id: user.id, name: user.name, email: user.email },
       count: emails.length,
       emails,
     };
     cache.set(user.id, { payload, at: Date.now() });
-    console.log(`Got ${emails.length} emails in ${Date.now() - t0}ms (fresh)`);
+    console.log(`Got ${emails.length} emails in ${Date.now() - t0}ms (warm-up)`);
     res.json(payload);
   } catch (err) {
     console.error(`Failed for ${user.email} after ${Date.now() - t0}ms:`, err.message);
@@ -333,9 +388,24 @@ app.get('/api/email/:userId/:seqno', async (req, res) => {
     const email = await fetchOneBody(user, seqno);
     res.json(email);
   } catch (err) {
-    console.error(`Body fetch failed for ${user.email}:`, err.message);
-    res.status(500).json({ error: err.message });
+    console.warn(`First fetch failed for ${user.email}, retrying with new connection:`, err.message);
+    pool.delete(user.id);
+    try {
+      const email = await fetchOneBody(user, seqno);
+      res.json(email);
+    } catch (retryErr) {
+      console.error(`Body fetch failed for ${user.email}:`, retryErr.message);
+      res.status(500).json({ error: retryErr.message });
+    }
   }
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 app.listen(PORT, () => {
